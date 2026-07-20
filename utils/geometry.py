@@ -83,6 +83,35 @@ def validate_intrinsics(intrinsics: CameraIntrinsics) -> None:
     if intrinsics.fx <= 0 or intrinsics.fy <= 0:
         raise ValueError(f"Focal lengths fx, fy must be positive, got fx={intrinsics.fx}, fy={intrinsics.fy}")
 
+def _is_edge_pixel_valid(
+    ey: int, ex: int, ez: float,
+    depth_m: np.ndarray,
+    inner_depths_only: np.ndarray,
+    mask_uint8: np.ndarray,
+    window_radius: int
+) -> bool:
+    if ez <= 0 or not np.isfinite(ez):
+        return False
+        
+    h, w = depth_m.shape
+    y1, y2 = max(0, ey - window_radius), min(h, ey + window_radius + 1)
+    x1, x2 = max(0, ex - window_radius), min(w, ex + window_radius + 1)
+    
+    local_inner = inner_depths_only[y1:y2, x1:x2]
+    valid_local_inner = local_inner[(local_inner > 0) & np.isfinite(local_inner)]
+    
+    if len(valid_local_inner) > 0:
+        local_median = np.median(valid_local_inner)
+        return abs(ez - local_median) <= 0.015
+        
+    local_all = depth_m[y1:y2, x1:x2]
+    valid_local_all = local_all[(local_all > 0) & np.isfinite(local_all) & (mask_uint8[y1:y2, x1:x2] > 0)]
+    if len(valid_local_all) > 0:
+        local_median = np.median(valid_local_all)
+        return abs(ez - local_median) <= 0.015
+        
+    return False
+
 def deproject_mask_to_point_cloud(
     mask_bool: np.ndarray,
     depth_m: np.ndarray,
@@ -119,32 +148,9 @@ def deproject_mask_to_point_cloud(
         for idx in range(len(edge_y)):
             ey, ex = edge_y[idx], edge_x[idx]
             ez = depth_m[ey, ex]
-            if ez <= 0 or not np.isfinite(ez):
-                edge_valid_map[ey, ex] = False
-                continue
-                
-            y1, y2 = max(0, ey - window_radius), min(h, ey + window_radius + 1)
-            x1, x2 = max(0, ex - window_radius), min(w, ex + window_radius + 1)
-            
-            # Extract local inner depths
-            local_inner = inner_depths_only[y1:y2, x1:x2]
-            valid_local_inner = local_inner[(local_inner > 0) & np.isfinite(local_inner)]
-            
-            if len(valid_local_inner) > 0:
-                local_median = np.median(valid_local_inner)
-                # Discard edge pixel if it deviates from local inner median by > 1.5 cm (0.015 m)
-                if abs(ez - local_median) > 0.015:
-                    edge_valid_map[ey, ex] = False
-            else:
-                # Fallback to local depths of the entire mask (if inner region is not nearby)
-                local_all = depth_m[y1:y2, x1:x2]
-                valid_local_all = local_all[(local_all > 0) & np.isfinite(local_all) & (mask_uint8[y1:y2, x1:x2] > 0)]
-                if len(valid_local_all) > 0:
-                    local_median = np.median(valid_local_all)
-                    if abs(ez - local_median) > 0.015:
-                        edge_valid_map[ey, ex] = False
-                else:
-                    edge_valid_map[ey, ex] = False
+            edge_valid_map[ey, ex] = _is_edge_pixel_valid(
+                ey, ex, ez, depth_m, inner_depths_only, mask_uint8, window_radius
+            )
                     
         # Apply the edge validity map to the flat coordinate array
         is_edge_pixel = edge_mask[v, u]
@@ -259,7 +265,6 @@ def assign_cross_section_bins(
     for b in range(num_bins):
         in_bin = (bin_ids == b)
         bin_pts = points[in_bin]
-        bin_proj = projections[in_bin]
         
         is_valid = len(bin_pts) >= min_points_per_bin
         bin_centroid = bin_pts.mean(axis=0) if is_valid else np.zeros(3)
@@ -285,6 +290,33 @@ def assign_cross_section_bins(
         
     return bins_data, projections
 
+def _compute_multiple_anchors(
+    points: np.ndarray,
+    projections: np.ndarray,
+    quantile: float
+) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[List[np.ndarray]], Optional[List[np.ndarray]]]:
+    quantiles_start = np.linspace(quantile / 5.0, quantile, 5)
+    quantiles_end = np.linspace(1.0 - quantile, 1.0 - (quantile / 5.0), 5)
+    
+    start_anchors = []
+    for q in quantiles_start:
+        q_val = np.quantile(projections, q)
+        pts = points[projections <= q_val]
+        if len(pts) > 0:
+            start_anchors.append(pts.mean(axis=0))
+            
+    end_anchors = []
+    for q in quantiles_end:
+        q_val = np.quantile(projections, q)
+        pts = points[projections >= q_val]
+        if len(pts) > 0:
+            end_anchors.append(pts.mean(axis=0))
+            
+    start_anchor = np.median(start_anchors, axis=0) if start_anchors else None
+    end_anchor = np.median(end_anchors, axis=0) if end_anchors else None
+    
+    return start_anchor, end_anchor, start_anchors, end_anchors
+
 def compute_tip_anchors(
     points: np.ndarray,
     projections: np.ndarray,
@@ -308,29 +340,7 @@ def compute_tip_anchors(
         return start_anchor, end_anchor, None, None
         
     if strategy == "multiple":
-        # Create 5 distinct sub-anchors at quantiles from 0.6% to 3.0%
-        quantiles_start = np.linspace(quantile / 5.0, quantile, 5)
-        quantiles_end = np.linspace(1.0 - quantile, 1.0 - (quantile / 5.0), 5)
-        
-        start_anchors = []
-        for q in quantiles_start:
-            q_val = np.quantile(projections, q)
-            pts = points[projections <= q_val]
-            if len(pts) > 0:
-                start_anchors.append(pts.mean(axis=0))
-                
-        end_anchors = []
-        for q in quantiles_end:
-            q_val = np.quantile(projections, q)
-            pts = points[projections >= q_val]
-            if len(pts) > 0:
-                end_anchors.append(pts.mean(axis=0))
-                
-        # Return the representative endpoint anchors (median of the group)
-        start_anchor = np.median(start_anchors, axis=0) if start_anchors else None
-        end_anchor = np.median(end_anchors, axis=0) if end_anchors else None
-        
-        return start_anchor, end_anchor, start_anchors, end_anchors
+        return _compute_multiple_anchors(points, projections, quantile)
         
     return None, None, None, None
 
@@ -410,6 +420,69 @@ def integrate_spline_arc_length(
     length_cm = length_m * 100.0
     return length_cm, spline_points
 
+def _extract_valid_centroids(bins_data: List[Dict[str, Any]]) -> Tuple[List[np.ndarray], int, int]:
+    valid_centroids = []
+    skipped_bin_count = 0
+    consecutive_missing = 0
+    max_consecutive_missing = 0
+    
+    for b in bins_data:
+        if b["valid"]:
+            valid_centroids.append(b["centroid"])
+            consecutive_missing = 0
+        else:
+            skipped_bin_count += 1
+            consecutive_missing += 1
+            max_consecutive_missing = max(max_consecutive_missing, consecutive_missing)
+            
+    return valid_centroids, skipped_bin_count, max_consecutive_missing
+
+def _build_spine(
+    valid_centroids: List[np.ndarray],
+    start_anchor: Optional[np.ndarray],
+    end_anchor: Optional[np.ndarray],
+    start_group: Optional[List[np.ndarray]],
+    end_group: Optional[List[np.ndarray]],
+    config: M5Config,
+    center: np.ndarray,
+    principal_axis: np.ndarray
+) -> np.ndarray:
+    spine_list = []
+    if config.use_tip_anchors and start_anchor is not None:
+        if config.tip_anchor_strategy == "multiple" and start_group is not None:
+            spine_list.extend(start_group)
+        else:
+            spine_list.append(start_anchor)
+            
+    spine_list.extend(valid_centroids)
+    
+    if config.use_tip_anchors and end_anchor is not None:
+        if config.tip_anchor_strategy == "multiple" and end_group is not None:
+            spine_list.extend(end_group)
+        else:
+            spine_list.append(end_anchor)
+            
+    return clean_and_sort_spine(np.array(spine_list), center, principal_axis)
+
+def _fail_m5_result(reason: str, diagnostics: Dict[str, Any], **kwargs) -> M5Result:
+    defaults = {
+        "raw_point_count": 0, "filtered_point_count": 0,
+        "valid_bin_count": 0, "skipped_bin_count": 0,
+        "principal_axis": None, "spine_points": None, "spline_points": None
+    }
+    defaults.update(kwargs)
+    return M5Result(
+        success=False, length_cm=None, failure_reason=reason,
+        raw_point_count=defaults["raw_point_count"],
+        filtered_point_count=defaults["filtered_point_count"],
+        valid_bin_count=defaults["valid_bin_count"],
+        skipped_bin_count=defaults["skipped_bin_count"],
+        principal_axis=defaults["principal_axis"],
+        spine_points=defaults["spine_points"],
+        spline_points=defaults["spline_points"],
+        diagnostics=diagnostics
+    )
+
 def measure_m5(
     mask: np.ndarray,
     aligned_depth: np.ndarray,
@@ -430,22 +503,10 @@ def measure_m5(
         depth_m = normalize_depth_to_meters(aligned_depth, config.depth_scale)
         validate_intrinsics(intrinsics)
     except ValueError as e:
-        return M5Result(
-            success=False, length_cm=None, failure_reason="invalid_input",
-            raw_point_count=0, filtered_point_count=0,
-            valid_bin_count=0, skipped_bin_count=0,
-            principal_axis=None, spine_points=None, spline_points=None,
-            diagnostics={"error": str(e)}
-        )
+        return _fail_m5_result("invalid_input", {"error": str(e)})
         
     if mask_bool.shape != depth_m.shape:
-        return M5Result(
-            success=False, length_cm=None, failure_reason="shape_mismatch",
-            raw_point_count=0, filtered_point_count=0,
-            valid_bin_count=0, skipped_bin_count=0,
-            principal_axis=None, spine_points=None, spline_points=None,
-            diagnostics={"mask_shape": mask_bool.shape, "depth_shape": depth_m.shape}
-        )
+        return _fail_m5_result("shape_mismatch", {"mask_shape": mask_bool.shape, "depth_shape": depth_m.shape})
         
     # 2. Point Cloud Generation
     points, deproj_stats = deproject_mask_to_point_cloud(mask_bool, depth_m, intrinsics)
@@ -453,13 +514,7 @@ def measure_m5(
     raw_point_count = len(points)
     
     if raw_point_count < config.min_valid_points:
-        return M5Result(
-            success=False, length_cm=None, failure_reason="insufficient_valid_depth",
-            raw_point_count=raw_point_count, filtered_point_count=0,
-            valid_bin_count=0, skipped_bin_count=0,
-            principal_axis=None, spine_points=None, spline_points=None,
-            diagnostics=diagnostics
-        )
+        return _fail_m5_result("insufficient_valid_depth", diagnostics, raw_point_count=raw_point_count)
         
     # 3. Median-depth filtering
     filtered_points, filter_stats = filter_points_by_median_depth(points, config.depth_threshold_m)
@@ -467,137 +522,70 @@ def measure_m5(
     filtered_point_count = len(filtered_points)
     
     if filtered_point_count < config.min_valid_points:
-        return M5Result(
-            success=False, length_cm=None, failure_reason="insufficient_points_after_filter",
-            raw_point_count=raw_point_count, filtered_point_count=filtered_point_count,
-            valid_bin_count=0, skipped_bin_count=0,
-            principal_axis=None, spine_points=None, spline_points=None,
-            diagnostics=diagnostics
-        )
+        return _fail_m5_result("insufficient_points_after_filter", diagnostics, raw_point_count=raw_point_count, filtered_point_count=filtered_point_count)
         
     # 4. PCA / SVD Growth Axis Vector
     try:
         center, principal_axis, pca_stats = compute_principal_axis(filtered_points)
         diagnostics.update(pca_stats)
     except Exception as e:
-        return M5Result(
-            success=False, length_cm=None, failure_reason="degenerate_point_cloud",
-            raw_point_count=raw_point_count, filtered_point_count=filtered_point_count,
-            valid_bin_count=0, skipped_bin_count=0,
-            principal_axis=None, spine_points=None, spline_points=None,
-            diagnostics={"error": str(e)}
-        )
+        return _fail_m5_result("degenerate_point_cloud", {"error": str(e), **diagnostics}, raw_point_count=raw_point_count, filtered_point_count=filtered_point_count)
         
     # 5. Cross-section Binning
     bins_data, projections = assign_cross_section_bins(
         filtered_points, center, principal_axis, config.num_bins, config.min_points_per_bin
     )
-    diagnostics["bins_data"] = bins_data
-    diagnostics["projection_min"] = float(projections.min())
-    diagnostics["projection_max"] = float(projections.max())
-    diagnostics["projection_range"] = float(np.ptp(projections))
+    diagnostics.update({
+        "bins_data": bins_data,
+        "projection_min": float(projections.min()),
+        "projection_max": float(projections.max()),
+        "projection_range": float(np.ptp(projections))
+    })
     
     if np.ptp(projections) < 1e-4:
-        return M5Result(
-            success=False, length_cm=None, failure_reason="degenerate_projection",
-            raw_point_count=raw_point_count, filtered_point_count=filtered_point_count,
-            valid_bin_count=0, skipped_bin_count=0,
-            principal_axis=principal_axis, spine_points=None, spline_points=None,
-            diagnostics=diagnostics
-        )
+        return _fail_m5_result("degenerate_projection", diagnostics, raw_point_count=raw_point_count, filtered_point_count=filtered_point_count, principal_axis=principal_axis)
         
-    # Separate valid centroids
-    valid_centroids = []
-    skipped_bin_count = 0
-    consecutive_missing = 0
-    max_consecutive_missing = 0
-    
-    for b in bins_data:
-        if b["valid"]:
-            valid_centroids.append(b["centroid"])
-            consecutive_missing = 0
-        else:
-            skipped_bin_count += 1
-            consecutive_missing += 1
-            max_consecutive_missing = max(max_consecutive_missing, consecutive_missing)
-            
+    valid_centroids, skipped_bin_count, max_consecutive_missing = _extract_valid_centroids(bins_data)
     valid_bin_count = len(valid_centroids)
     missing_bin_ratio = skipped_bin_count / config.num_bins
-    diagnostics["missing_bin_ratio"] = missing_bin_ratio
-    diagnostics["max_consecutive_missing_bins"] = max_consecutive_missing
+    diagnostics.update({
+        "missing_bin_ratio": missing_bin_ratio,
+        "max_consecutive_missing_bins": max_consecutive_missing
+    })
     
     # Occlusion limits validation
     if missing_bin_ratio > config.max_missing_bin_ratio or max_consecutive_missing > config.max_consecutive_missing_bins:
-        return M5Result(
-            success=False, length_cm=None, failure_reason="insufficient_valid_bins",
-            raw_point_count=raw_point_count, filtered_point_count=filtered_point_count,
-            valid_bin_count=valid_bin_count, skipped_bin_count=skipped_bin_count,
-            principal_axis=principal_axis, spine_points=np.array(valid_centroids) if valid_centroids else None,
-            spline_points=None, diagnostics=diagnostics
-        )
+        spine_pts = np.array(valid_centroids) if valid_centroids else None
+        return _fail_m5_result("insufficient_valid_bins", diagnostics, raw_point_count=raw_point_count, filtered_point_count=filtered_point_count, valid_bin_count=valid_bin_count, skipped_bin_count=skipped_bin_count, principal_axis=principal_axis, spine_points=spine_pts)
         
     # 6. Tip Anchors
     start_anchor, end_anchor, start_group, end_group = compute_tip_anchors(
         filtered_points, projections, config.tip_anchor_strategy, config.tip_quantile
     )
     
-    diagnostics["start_anchor"] = start_anchor.tolist() if start_anchor is not None else None
-    diagnostics["end_anchor"] = end_anchor.tolist() if end_anchor is not None else None
+    diagnostics.update({
+        "start_anchor": start_anchor.tolist() if start_anchor is not None else None,
+        "end_anchor": end_anchor.tolist() if end_anchor is not None else None
+    })
     
-    # Construct spine
-    spine_list = []
-    if config.use_tip_anchors and start_anchor is not None:
-        if strategy_is_multiple := (config.tip_anchor_strategy == "multiple"):
-            # Append all start sub-anchors
-            spine_list.extend(start_group)
-        else:
-            spine_list.append(start_anchor)
-            
-    spine_list.extend(valid_centroids)
-    
-    if config.use_tip_anchors and end_anchor is not None:
-        if strategy_is_multiple:
-            spine_list.extend(end_group)
-        else:
-            spine_list.append(end_anchor)
-            
-    # Sort and clean spine points
-    spine_points = clean_and_sort_spine(np.array(spine_list), center, principal_axis)
+    spine_points = _build_spine(valid_centroids, start_anchor, end_anchor, start_group, end_group, config, center, principal_axis)
     
     if len(spine_points) < config.min_spine_points:
-        return M5Result(
-            success=False, length_cm=None, failure_reason="insufficient_spine_points",
-            raw_point_count=raw_point_count, filtered_point_count=filtered_point_count,
-            valid_bin_count=valid_bin_count, skipped_bin_count=skipped_bin_count,
-            principal_axis=principal_axis, spine_points=spine_points, spline_points=None,
-            diagnostics=diagnostics
-        )
+        return _fail_m5_result("insufficient_spine_points", diagnostics, raw_point_count=raw_point_count, filtered_point_count=filtered_point_count, valid_bin_count=valid_bin_count, skipped_bin_count=skipped_bin_count, principal_axis=principal_axis, spine_points=spine_points)
         
     # 7. Chord-length parameterization
     try:
         u, cumulative = chord_length_parameterize(spine_points)
         diagnostics["total_chord_length_cm"] = float(cumulative[-1] * 100.0)
     except Exception as e:
-        return M5Result(
-            success=False, length_cm=None, failure_reason="invalid_chord_parameterization",
-            raw_point_count=raw_point_count, filtered_point_count=filtered_point_count,
-            valid_bin_count=valid_bin_count, skipped_bin_count=skipped_bin_count,
-            principal_axis=principal_axis, spine_points=spine_points, spline_points=None,
-            diagnostics={"error": str(e)}
-        )
+        return _fail_m5_result("invalid_chord_parameterization", {"error": str(e), **diagnostics}, raw_point_count=raw_point_count, filtered_point_count=filtered_point_count, valid_bin_count=valid_bin_count, skipped_bin_count=skipped_bin_count, principal_axis=principal_axis, spine_points=spine_points)
         
     # 8 & 9. Spline fitting & Integration
     try:
         sx, sy, sz = fit_natural_cubic_spline(u, spine_points)
         length_cm, spline_points = integrate_spline_arc_length(sx, sy, sz, config.integration_samples)
     except Exception as e:
-        return M5Result(
-            success=False, length_cm=None, failure_reason="spline_fitting_failed",
-            raw_point_count=raw_point_count, filtered_point_count=filtered_point_count,
-            valid_bin_count=valid_bin_count, skipped_bin_count=skipped_bin_count,
-            principal_axis=principal_axis, spine_points=spine_points, spline_points=None,
-            diagnostics={"error": str(e)}
-        )
+        return _fail_m5_result("spline_fitting_failed", {"error": str(e), **diagnostics}, raw_point_count=raw_point_count, filtered_point_count=filtered_point_count, valid_bin_count=valid_bin_count, skipped_bin_count=skipped_bin_count, principal_axis=principal_axis, spine_points=spine_points)
         
     # 10. Spline/Polyline Ratio check (overshoot check)
     polyline_length_cm = float(cumulative[-1] * 100.0)
@@ -605,24 +593,12 @@ def measure_m5(
     diagnostics["spline_polyline_ratio"] = ratio
     
     if ratio > config.max_spline_polyline_ratio:
-        return M5Result(
-            success=False, length_cm=None, failure_reason="spline_fitting_failed",
-            raw_point_count=raw_point_count, filtered_point_count=filtered_point_count,
-            valid_bin_count=valid_bin_count, skipped_bin_count=skipped_bin_count,
-            principal_axis=principal_axis, spine_points=spine_points, spline_points=spline_points,
-            diagnostics=diagnostics
-        )
+        return _fail_m5_result("spline_fitting_failed", diagnostics, raw_point_count=raw_point_count, filtered_point_count=filtered_point_count, valid_bin_count=valid_bin_count, skipped_bin_count=skipped_bin_count, principal_axis=principal_axis, spine_points=spine_points, spline_points=spline_points)
         
     # 11. Range check
     if not (config.min_length_cm <= length_cm <= config.max_length_cm):
         diagnostics["unvalidated_length_cm"] = length_cm
-        return M5Result(
-            success=False, length_cm=None, failure_reason="length_out_of_range",
-            raw_point_count=raw_point_count, filtered_point_count=filtered_point_count,
-            valid_bin_count=valid_bin_count, skipped_bin_count=skipped_bin_count,
-            principal_axis=principal_axis, spine_points=spine_points, spline_points=spline_points,
-            diagnostics=diagnostics
-        )
+        return _fail_m5_result("length_out_of_range", diagnostics, raw_point_count=raw_point_count, filtered_point_count=filtered_point_count, valid_bin_count=valid_bin_count, skipped_bin_count=skipped_bin_count, principal_axis=principal_axis, spine_points=spine_points, spline_points=spline_points)
         
     return M5Result(
         success=True, length_cm=length_cm, failure_reason=None,
@@ -678,7 +654,7 @@ def save_m5_debug_visualization(
     ax_3d = fig.add_subplot(1, 2, 2, projection='3d')
     
     # Extract point cloud for plotting (downsampled for performance)
-    mask_y, mask_x = np.where(mask > 0)
+    mask_y, mask_x = np.nonzero(mask > 0)
     if len(mask_y) > 0:
         depth_m = depth.astype(np.float64) / 1000.0  # assume raw depth for visualization, scale as needed
         z = depth_m[mask_y, mask_x]

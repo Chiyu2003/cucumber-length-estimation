@@ -1,11 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-main.py
-=======
-Main entry point for cucumber length estimation using YOLO segmentation and 3D spline reconstruction.
-"""
-
 import os
 import sys
 import cv2
@@ -23,6 +15,7 @@ from utils.geometry import CameraIntrinsics, measure_m5
 WEIGHTS_PATH = os.path.join(ROOT_DIR, "weights", "cucumber_seg.pt")
 DATA_DIR = os.path.join(ROOT_DIR, "data")
 OUTPUT_DIR = os.path.join(ROOT_DIR, "output")
+DEPTH_SUFFIX = "_depth.npy"
 
 def process_image(img_name, yolo, intrinsics):
     img_path = os.path.join(DATA_DIR, img_name)
@@ -31,12 +24,12 @@ def process_image(img_name, yolo, intrinsics):
         return
         
     # Load associated depth map (.npy)
-    depth_name = img_name.replace(".png", "_depth.npy").replace(".jpg", "_depth.npy").replace(".jpeg", "_depth.npy")
+    depth_name = img_name.replace(".png", DEPTH_SUFFIX).replace(".jpg", DEPTH_SUFFIX).replace(".jpeg", DEPTH_SUFFIX)
     depth_path = os.path.join(DATA_DIR, depth_name)
     if not os.path.exists(depth_path):
         # Fallback to search depth file containing '_depth' keyword
         base_name = os.path.splitext(img_name)[0]
-        depth_path = os.path.join(DATA_DIR, f"{base_name}_depth.npy")
+        depth_path = os.path.join(DATA_DIR, f"{base_name}{DEPTH_SUFFIX}")
         
     if not os.path.exists(depth_path):
         print(f"[Warning] Depth file not found for {img_name}, skipping.")
