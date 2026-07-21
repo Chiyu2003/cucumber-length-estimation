@@ -17,6 +17,38 @@ DATA_DIR = os.path.join(ROOT_DIR, "data")
 OUTPUT_DIR = os.path.join(ROOT_DIR, "output")
 DEPTH_SUFFIX = "_depth.npy"
 
+def filter_duplicate_boxes(boxes, masks, confs=None, iou_thresh=0.40):
+    if len(boxes) == 0:
+        return [], []
+    if confs is None:
+        order = np.argsort([(b[2]-b[0])*(b[3]-b[1]) for b in boxes])[::-1]
+    else:
+        order = np.argsort(confs)[::-1]
+        
+    keep_indices = []
+    while len(order) > 0:
+        i = order[0]
+        keep_indices.append(i)
+        if len(order) == 1:
+            break
+        box_i = boxes[i]
+        rem_boxes = boxes[order[1:]]
+        
+        xi1 = np.maximum(box_i[0], rem_boxes[:, 0])
+        yi1 = np.maximum(box_i[1], rem_boxes[:, 1])
+        xi2 = np.minimum(box_i[2], rem_boxes[:, 2])
+        yi2 = np.minimum(box_i[3], rem_boxes[:, 3])
+        
+        inter_area = np.maximum(0.0, xi2 - xi1) * np.maximum(0.0, yi2 - yi1)
+        area_i = (box_i[2] - box_i[0]) * (box_i[3] - box_i[1])
+        rem_areas = (rem_boxes[:, 2] - rem_boxes[:, 0]) * (rem_boxes[:, 3] - rem_boxes[:, 1])
+        iou = inter_area / (area_i + rem_areas - inter_area + 1e-8)
+        
+        mask_keep = np.where(iou <= iou_thresh)[0]
+        order = order[mask_keep + 1]
+        
+    return [boxes[k] for k in keep_indices], [masks[k] for k in keep_indices]
+
 def process_image(img_name, yolo, intrinsics):
     img_path = os.path.join(DATA_DIR, img_name)
     img = cv2.imread(img_path)
@@ -39,13 +71,17 @@ def process_image(img_name, yolo, intrinsics):
     if depth_map.max() > 50.0:  # Convert mm to meters if raw depth is in millimeters
         depth_map /= 1000.0
         
-    # Segment instances
-    results = yolo.predict(source=img, conf=0.25, verbose=False)[0]
+    # Segment instances with NMS iou threshold
+    results = yolo.predict(source=img, conf=0.35, iou=0.40, verbose=False)[0]
     annotated = img.copy()
     
     if results.masks is not None:
-        boxes = results.boxes.xyxy.cpu().numpy()
-        masks = results.masks.xy
+        raw_boxes = results.boxes.xyxy.cpu().numpy()
+        raw_confs = results.boxes.conf.cpu().numpy()
+        raw_masks = results.masks.xy
+        
+        # Filter duplicate overlapping bounding boxes on the same cucumber
+        boxes, masks = filter_duplicate_boxes(raw_boxes, raw_masks, confs=raw_confs, iou_thresh=0.40)
         
         # 1. 先合併所有小黃瓜的二值遮罩
         merged_mask = np.zeros(img.shape[:2], dtype=np.uint8)

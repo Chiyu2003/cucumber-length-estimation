@@ -43,7 +43,7 @@ class M5Config:
     min_length_cm: float = 5.0
     max_length_cm: float = 80.0
     use_tip_anchors: bool = True
-    tip_quantile: float = 0.03
+    tip_quantile: float = 0.002
     tip_anchor_strategy: str = "single"  # "none", "single", "multiple"
     max_missing_bin_ratio: float = 0.4
     max_consecutive_missing_bins: int = 5
@@ -182,19 +182,33 @@ def deproject_mask_to_point_cloud(
 
 def filter_points_by_median_depth(
     points: np.ndarray,
-    threshold_m: float
+    threshold_m: float,
+    fx: float = 912.34,
+    fy: float = 911.85,
+    cx: float = 638.12,
+    cy: float = 357.45
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
-    """Filters 3D points within a median depth window."""
+    """Filters 3D points using 3D plane trend depth fitting to support tilted cucumbers."""
     if len(points) == 0:
         return points, {"median_depth": 0.0, "removed_ratio": 0.0}
     
-    median_z = np.median(points[:, 2])
-    inliers = np.abs(points[:, 2] - median_z) <= threshold_m
-    filtered_points = points[inliers]
+    median_z = float(np.median(points[:, 2]))
+    u_pts = (points[:, 0] * fx / points[:, 2]) + cx
+    v_pts = (points[:, 1] * fy / points[:, 2]) + cy
     
+    try:
+        A = np.column_stack([u_pts, v_pts, np.ones_like(u_pts)])
+        res_plane, _, _, _ = np.linalg.lstsq(A, points[:, 2], rcond=None)
+        z_pred = A @ res_plane
+        inliers = np.abs(points[:, 2] - z_pred) <= threshold_m
+    except Exception:
+        inliers = np.abs(points[:, 2] - median_z) <= threshold_m
+        
+    filtered_points = points[inliers]
     removed_ratio = (len(points) - len(filtered_points)) / len(points)
+    
     stats = {
-        "median_depth": float(median_z),
+        "median_depth": median_z,
         "removed_ratio": float(removed_ratio)
     }
     return filtered_points, stats
